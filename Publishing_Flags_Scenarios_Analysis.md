@@ -979,23 +979,6 @@ public enum PublishingEventType {
 
 ### Summary of Recommendations
 
-```mermaid
-pie User Story Objective
-This scenario directly addresses the user story requirement: *"robust exception handling to ensure that processing flags (such as 'pre-processing-flag' and 'publishToPre') are properly reset and persisted during bulk publishing workflows, so that publishing failures do not require manual intervention."*
-
-### Acceptance Criteria
-✅ **Given**: A bulk publishing job is reviewed  
-✅ **When**: The team analyzes exception handling during the publishing process  
-✅ **Then**: Recommendations are documented for how the system should handle exceptions gracefully  
-✅ **And**: Recommendations are provided for ensuring the corresponding flags (e.g., 'pre-processing-flag') are reset and persisted in the repository without manual intervention
-
-### Analysis Focus
-- **Current Implementation**: `EYBulkPublishLiveServiceImpl.java`
-- **Flag Lifecycle**: How flags are managed during batch processing
-- **Exception Patterns**: Where exceptions can occur and leave flags in inconsistent state
-- **Persistence Guarantees**: Ensuring flags are committed to JCR even on failure
-```
-
 **Priority Matrix**
 
 | Action | Flags Affected | Business Value | Technical Effort | Priority |
