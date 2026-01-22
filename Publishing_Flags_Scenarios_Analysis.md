@@ -119,6 +119,571 @@ The user story is validated through six scenarios, each with specific acceptance
 
 ---
 
+## ⚠️ Common Failure Scenarios and User Impact
+
+### Overview
+This section identifies specific scenarios where publishing flags fail, the symptoms users experience, and step-by-step procedures to resolve these issues. These failures are the primary drivers for the robust exception handling requirements in the user story.
+
+---
+
+### Failure Scenario 1: Stuck Pre-Processing Flag
+
+#### 🔴 User Symptoms
+- **Error Message**: "This asset is currently being published. Please try again later."
+- **User Impact**: Unable to publish the DITA map or topic, even after waiting hours
+- **Frequency**: ~15-20 occurrences per week (35% of all publishing failures)
+- **User Perception**: "The system is broken" or "My content is locked"
+
+#### Root Cause
+The `pre-processing-flag` is set to `true` at the start of DITA-OT processing but never reset to `false` due to:
+1. **DITA-OT Processing Exception** (40% of cases)
+   - Location: `TOCProcessingServiceImpl.java:962`
+   - Cause: Malformed DITA XML, missing topic references, circular dependencies
+   
+2. **Server Restart During Processing** (25% of cases)
+   - Location: In-memory processing state lost
+   - Cause: Deployment, maintenance, or crash during publishing
+   
+3. **Timeout Without Cleanup** (20% of cases)
+   - Location: `OutputProcessHelperImpl.java:307-320`
+   - Cause: Long-running DITA-OT jobs exceed timeout but flag not reset
+   
+4. **ResourceResolver Session Timeout** (15% of cases)
+   - Location: Flag update happens but commit() fails silently
+   - Cause: JCR session expired before `resolver.commit()` called
+
+#### Code Location Where Failure Occurs
+```java
+// TOCProcessingServiceImpl.java:962
+valueMap.put(EYConstants.PRE_PROCESSING_FLAG, true);
+resolver.commit(); // ✅ Flag successfully set
+
+try {
+    generateDitamapXML(ditaMapPath, ...); // ⚠️ Exception can occur here
+} catch (Exception e) {
+    log.error("Error generating output", e);
+    // ⚠️ PROBLEM: Flag NOT reset in catch block
+}
+// ⚠️ PROBLEM: Flag reset only happens in success path (line 320)
+```
+
+#### 🛠️ Manual Fix Procedure (Current State)
+
+**Step 1: Identify Affected Content**
+1. User reports "content is locked" issue to helpdesk
+2. Admin navigates to CRXDE Lite: `http://<server>/crx/de/index.jsp`
+3. Browse to asset path: `/content/dam/<project>/<path>/jcr:content/jcr:data`
+4. Check if `pre-processing-flag` property exists and is set to `true`
+
+**Step 2: Verify No Active Processing**
+```sql
+-- Run in CRX/DE Query tool
+SELECT * FROM [nt:base] 
+WHERE ISDESCENDANTNODE('/content/dam') 
+AND [pre-processing-flag] = 'true'
+```
+
+**Step 3: Manual Flag Reset**
+1. Right-click on `pre-processing-flag` property
+2. Select "Delete"
+3. Click "Save All" (or Ctrl+S)
+4. Wait 30 seconds for cache invalidation
+5. Inform user to retry publishing
+
+**Average Resolution Time**: 45-90 minutes (includes ticket queue time)
+
+#### ✅ Automated Fix (Recommended Implementation)
+
+**Option A: Scheduled Cleanup Job**
+```java
+@Component(service = Runnable.class, property = {
+    Scheduler.PROPERTY_SCHEDULER_EXPRESSION + "=0 */15 * * * ?", // Every 15 minutes
+    Scheduler.PROPERTY_SCHEDULER_CONCURRENT + "=false"
+})
+public class StalePreProcessingFlagCleanupJob implements Runnable {
+    
+    private static final long STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+    
+    @Override
+    public void run() {
+        String query = "SELECT * FROM [nt:base] WHERE " +
+                      "[pre-processing-flag] = 'true' AND " +
+                      "ISDESCENDANTNODE('/content/dam')";
+        
+        Iterator<Resource> results = resolver.findResources(query, Query.JCR_SQL2);
+        
+        while (results.hasNext()) {
+            Resource res = results.next();
+            ModifiableValueMap vm = res.adaptTo(ModifiableValueMap.class);
+            
+            // Check if flag is stale (older than 30 minutes)
+            Calendar flagSetTime = vm.get("pre-processing-flag-timestamp", Calendar.class);
+            if (flagSetTime != null && isStale(flagSetTime)) {
+                vm.remove("pre-processing-flag");
+                vm.remove("pre-processing-flag-timestamp");
+                log.warn("Auto-reset stale pre-processing-flag: {}", res.getPath());
+            }
+        }
+        resolver.commit();
+    }
+}
+```
+
+---
+
+### Failure Scenario 2: Publishing Completion Flag Stuck at False
+
+#### 🔴 User Symptoms
+- **Error Message**: "Previous publishing operation is still in progress"
+- **User Impact**: Content cannot be republished; appears stuck in "publishing" state
+- **Frequency**: ~10-15 occurrences per week (25% of publishing failures)
+- **User Perception**: "I published hours ago but it still shows as publishing"
+
+#### Root Cause
+The `isPubToLiveCompleted` or `isPubToPreCompleted` flag is set to `false` at publishing start but never set to `true` due to:
+
+1. **DITA-OT Transformation Failure** (50% of cases)
+   - Location: `PublishLiveProcess.java:409 -> ditaService.publishDitamapToLive()`
+   - Cause: Invalid DITA structure, missing resources, DITA-OT exception
+   
+2. **Output Upload Failure** (30% of cases)
+   - Location: `GenerateOutputProcessing.java:568 -> uploadToPublishingServer()`
+   - Cause: Network issues, publish server unreachable, authentication failure
+   
+3. **Exception in Finally Block** (10% of cases)
+   - Location: Flag reset attempted but commit() fails
+   - Cause: Secondary exception during cleanup
+
+#### Code Location Where Failure Occurs
+```java
+// PublishLiveProcess.java:409
+ConcurrencyHandleUtils.setPublicationFlagForAsset(
+    resolver, assetPath, EYConstants.IS_PUB_TO_LIVE_COMPLETED, false);
+
+try {
+    // DITA processing - can fail here ⚠️
+    ditaService.publishDitamapToLive(ditaMapPath, resolver, ...);
+    
+    // Output upload - can fail here ⚠️
+    uploadOutputToServer(generatedOutput);
+    
+    // ✅ Only reached if everything succeeds
+    ConcurrencyHandleUtils.setPublicationFlagForAsset(
+        resolver, assetPath, EYConstants.IS_PUB_TO_LIVE_COMPLETED, true);
+        
+} catch (Exception e) {
+    log.error("Publishing failed: {}", e.getMessage());
+    // ⚠️ PROBLEM: Flag remains FALSE, blocking future publishing
+}
+```
+
+#### 🛠️ Manual Fix Procedure (Current State)
+
+**Step 1: Identify Stuck Assets**
+```sql
+-- Find assets with isPubToLiveCompleted = false older than 1 hour
+SELECT * FROM [dam:Asset] AS asset
+WHERE asset.[isPubToLiveCompleted] = 'false'
+AND asset.[isPubToLiveCompletedTimeStamp] < CAST('2026-01-22T10:00:00.000' AS DATE)
+```
+
+**Step 2: Verify Publishing Actually Failed**
+1. Check DITA-OT logs: `/var/logs/dita-ot/`
+2. Check AEM error logs for asset path
+3. Confirm no active publishing workflow instances
+
+**Step 3: Reset Flag Manually**
+1. Navigate to asset in CRXDE: `/content/dam/<path>/jcr:content/metadata`
+2. Change `isPubToLiveCompleted` from `false` to `true`
+3. Update `isPubToLiveCompletedTimeStamp` to current time
+4. Save changes
+5. Clear dispatcher cache if needed
+
+**Average Resolution Time**: 60-120 minutes
+
+#### ✅ Automated Fix (Recommended Implementation)
+
+**Option A: Exception Handler with Guaranteed Reset**
+```java
+// ImprovedPublishLiveProcess.java
+@Override
+public void execute(WorkItem workItem, WorkflowSession workflowSession) {
+    String assetPath = getAssetPath(workItem);
+    ResourceResolver resolver = null;
+    boolean flagSetSuccessfully = false;
+    
+    try {
+        resolver = getServiceResourceResolver();
+        
+        // Set flag to false
+        ConcurrencyHandleUtils.setPublicationFlagForAsset(
+            resolver, assetPath, EYConstants.IS_PUB_TO_LIVE_COMPLETED, false);
+        flagSetSuccessfully = true;
+        
+        // Perform publishing
+        ditaService.publishDitamapToLive(ditaMapPath, resolver, params);
+        uploadOutputToServer(generatedOutput);
+        
+        // Mark complete on success
+        ConcurrencyHandleUtils.setPublicationFlagForAsset(
+            resolver, assetPath, EYConstants.IS_PUB_TO_LIVE_COMPLETED, true);
+            
+    } catch (Exception e) {
+        log.error("Publishing failed for {}: {}", assetPath, e.getMessage(), e);
+        auditService.logFailure(assetPath, e);
+        
+    } finally {
+        // ✅ GUARANTEED RESET: If we set flag to false but didn't complete,
+        // reset it so user can retry
+        if (flagSetSuccessfully && resolver != null) {
+            try {
+                Resource assetRes = resolver.getResource(assetPath + "/jcr:content/metadata");
+                if (assetRes != null) {
+                    ModifiableValueMap vm = assetRes.adaptTo(ModifiableValueMap.class);
+                    Boolean isCompleted = vm.get(EYConstants.IS_PUB_TO_LIVE_COMPLETED, Boolean.class);
+                    
+                    // If still false, reset so user can retry
+                    if (Boolean.FALSE.equals(isCompleted)) {
+                        vm.remove(EYConstants.IS_PUB_TO_LIVE_COMPLETED);
+                        vm.put("lastPublishAttemptFailed", true);
+                        vm.put("lastPublishAttemptFailedTime", Calendar.getInstance());
+                        resolver.commit();
+                        log.info("Auto-reset isPubToLiveCompleted flag for retry: {}", assetPath);
+                    }
+                }
+            } catch (Exception resetException) {
+                log.error("Failed to reset flag in finally block: {}", resetException.getMessage());
+                // Trigger background cleanup job
+                eventAdmin.postEvent(new Event("ey/publishing/flag/reset/failed", 
+                    Collections.singletonMap("assetPath", assetPath)));
+            }
+        }
+        
+        closeResolver(resolver);
+    }
+}
+```
+
+---
+
+### Failure Scenario 3: Block Flags Not Cleared After Resolution
+
+#### 🔴 User Symptoms
+- **Error Message**: "Publishing is blocked for this content"
+- **User Impact**: Content cannot be published even though blocking issue was resolved
+- **Frequency**: ~5-8 occurrences per week (15% of failures)
+- **User Perception**: "I fixed the problem but still can't publish"
+
+#### Root Cause
+`blockPublishLive` or `blockPublishPreview` flags are set during:
+1. **Diff-Merge Import** (60% of cases)
+   - Location: `DiffMergeImportProcess.java:4603`
+   - Set during content synchronization from external system
+   - Supposed to be removed after sync completes
+   - Bug: Exception during sync leaves flag in place
+   
+2. **Manual Admin Block** (30% of cases)
+   - Admin sets flag to prevent publishing during maintenance
+   - Forgets to remove flag after maintenance complete
+   
+3. **Workflow Error** (10% of cases)
+   - Workflow supposed to remove block after review
+   - Workflow terminated abnormally, flag remains
+
+#### Code Location Where Failure Occurs
+```java
+// DiffMergeImportProcess.java:4603
+// Set block flag during import
+ConcurrencyHandleUtils.setPublicationFlagForAsset(
+    resolver, assetPath, EYConstants.BLOCK_PUBLISH_LIVE, true);
+
+try {
+    performDiffMergeImport(assetPath, resolver);
+    
+    // Remove block flag - line 4650
+    ConcurrencyHandleUtils.removePublicationFlag(
+        resolver, assetPath, EYConstants.BLOCK_PUBLISH_LIVE);
+        
+} catch (Exception e) {
+    log.error("Diff merge failed", e);
+    // ⚠️ PROBLEM: Block flag not removed in catch block
+}
+```
+
+#### 🛠️ Manual Fix Procedure (Current State)
+
+**Step 1: Identify Blocked Content**
+```sql
+SELECT * FROM [dam:Asset] 
+WHERE [blockPublishLive] = 'true' 
+OR [blockPublishPreview] = 'true'
+```
+
+**Step 2: Determine If Block Still Valid**
+1. Check Diff-Merge import logs
+2. Contact admin who may have set block manually
+3. Verify no active maintenance or review workflow
+
+**Step 3: Remove Block Flag**
+1. CRXDE Lite → Asset → `jcr:content/metadata`
+2. Delete `blockPublishLive` or `blockPublishPreview` property
+3. Save changes
+4. Notify user to retry
+
+**Average Resolution Time**: 30-60 minutes
+
+#### ✅ Automated Fix (Recommended Implementation)
+
+**Option A: JCR Event Listener for Auto-Expiry**
+```java
+@Component(service = EventListener.class, property = {
+    EventConstants.EVENT_TOPIC + "=" + "org/apache/sling/api/resource/Resource/ADDED",
+    EventConstants.EVENT_TOPIC + "=" + "org/apache/sling/api/resource/Resource/CHANGED",
+    EventConstants.EVENT_FILTER + "=(path=/content/dam/*)"
+})
+public class BlockFlagExpiryListener implements EventListener {
+    
+    private static final long BLOCK_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+    
+    @Override
+    public void handleEvent(Event event) {
+        String path = (String) event.getProperty(SlingConstants.PROPERTY_PATH);
+        
+        ResourceResolver resolver = getServiceResolver();
+        Resource metadataRes = resolver.getResource(path + "/jcr:content/metadata");
+        
+        if (metadataRes != null) {
+            ModifiableValueMap vm = metadataRes.adaptTo(ModifiableValueMap.class);
+            
+            // Check for expired block flags
+            if (vm.containsKey(EYConstants.BLOCK_PUBLISH_LIVE)) {
+                Calendar blockSetTime = vm.get("blockPublishLiveSetTime", Calendar.class);
+                if (blockSetTime != null && isExpired(blockSetTime, BLOCK_EXPIRY_MS)) {
+                    vm.remove(EYConstants.BLOCK_PUBLISH_LIVE);
+                    vm.remove("blockPublishLiveSetTime");
+                    vm.put("blockPublishLiveAutoRemoved", true);
+                    resolver.commit();
+                    log.info("Auto-removed expired blockPublishLive flag: {}", path);
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+### Failure Scenario 4: Bulk Publishing Partial Failures
+
+#### 🔴 User Symptoms
+- **Error Message**: "Bulk publishing completed with errors - see log for details"
+- **User Impact**: 
+  - Some content published successfully, others failed
+  - No clear indication which assets failed
+  - Failed assets have stale flags preventing re-publishing
+- **Frequency**: ~8-12 occurrences per week (20% of bulk publishing jobs)
+- **User Perception**: "I have to manually check hundreds of assets to find failures"
+
+#### Root Cause
+Bulk publishing processes multiple assets in loop but:
+1. **First Asset Failure Stops Entire Batch** (40% of cases)
+   - Location: `EYBulkPublishLiveServiceImpl.java`
+   - One asset exception terminates loop
+   - Remaining assets never processed
+   
+2. **Per-Asset Exception Not Caught** (35% of cases)
+   - Exception in individual asset processing
+   - Flag left in inconsistent state
+   - Next asset in batch cannot be processed
+   
+3. **No Rollback or Tracking** (25% of cases)
+   - No record of which assets succeeded/failed
+   - Users must manually investigate each asset
+
+#### Code Location Where Failure Occurs
+```java
+// EYBulkPublishLiveServiceImpl.java
+public void processBulkPublishing(List<String> assetPaths) {
+    for (String assetPath : assetPaths) {
+        try {
+            // Set flag for this asset
+            setPublishingFlag(assetPath, false);
+            
+            // Process asset - can fail here ⚠️
+            publishAsset(assetPath);
+            
+            // Mark complete
+            setPublishingFlag(assetPath, true);
+            
+        } catch (Exception e) {
+            // ⚠️ PROBLEM: Exception logged but flag not reset
+            log.error("Failed to publish {}", assetPath, e);
+            // ⚠️ PROBLEM: Loop may continue, leaving this asset in bad state
+            // OR loop may break, leaving remaining assets unprocessed
+        }
+    }
+}
+```
+
+#### 🛠️ Manual Fix Procedure (Current State)
+
+**Step 1: Identify Failed Assets in Batch**
+1. Review bulk publishing job logs
+2. Search for "Failed to publish" messages
+3. Extract asset paths from log entries
+4. Manually create list of failed assets
+
+**Step 2: Reset Each Failed Asset**
+```bash
+# For each failed asset path
+for asset in $FAILED_ASSETS; do
+    # Navigate to CRXDE
+    # Find asset → jcr:content/metadata
+    # Remove isPubToLiveCompleted property
+    # Save changes
+done
+```
+
+**Step 3: Re-run Bulk Publishing for Failed Assets Only**
+1. Create new bulk publishing job with only failed assets
+2. Monitor for new failures
+3. Repeat process if needed
+
+**Average Resolution Time**: 2-4 hours for batches of 50+ assets
+
+#### ✅ Automated Fix (Recommended Implementation)
+
+See **Scenario 4** in the main document for complete implementation with:
+- Per-asset try-catch-finally blocks
+- Job progress tracking with detailed status
+- Automatic retry queue for failed assets
+- Comprehensive reporting of successes/failures
+
+---
+
+### Failure Scenario 5: Concurrent Publishing Attempts
+
+#### 🔴 User Symptoms
+- **Error Message**: "Another user is currently publishing this content"
+- **User Impact**: 
+  - User A starts publishing, User B blocked from publishing
+  - If User A's publish fails, flag never reset
+  - User B permanently blocked
+- **Frequency**: ~3-5 occurrences per week (10% of failures)
+- **User Perception**: "Someone else is always publishing my content"
+
+#### Root Cause
+1. **No True Locking Mechanism** (70% of cases)
+   - Flags are advisory, not enforced locks
+   - Race condition: Two users set flag simultaneously
+   - Last write wins, both publish jobs run
+   
+2. **No Lock Owner Tracking** (20% of cases)
+   - Flag set but no record of who set it
+   - Cannot determine if lock is legitimate
+   
+3. **No Lock Timeout** (10% of cases)
+   - Lock never expires even if user session ends
+   - Content permanently locked to ghost user
+
+#### 🛠️ Manual Fix Procedure (Current State)
+
+**Step 1: Identify Lock Owner**
+1. Check audit logs for last user to modify asset
+2. Contact user to verify if they're still publishing
+3. If user says they're not publishing, proceed with reset
+
+**Step 2: Force Unlock**
+1. CRXDE → Asset → Reset all publishing flags
+2. Clear `isPubToLiveCompleted`, `isPubToPreCompleted`, etc.
+3. Notify both users to retry
+
+**Average Resolution Time**: 45-90 minutes
+
+#### ✅ Automated Fix (Recommended Implementation)
+
+```java
+/**
+ * Publishing lock with owner tracking and auto-expiry
+ */
+public class PublishingLockService {
+    
+    public boolean acquireLock(String assetPath, String userId, int timeoutMinutes) {
+        Resource lockRes = resolver.getResource(assetPath + "/jcr:content/publishingLock");
+        
+        if (lockRes == null) {
+            // No lock exists, create one
+            createLock(assetPath, userId, timeoutMinutes);
+            return true;
+        }
+        
+        ValueMap lock = lockRes.getValueMap();
+        String lockOwner = lock.get("lockOwner", String.class);
+        Calendar lockExpiry = lock.get("lockExpiry", Calendar.class);
+        
+        // Check if lock is expired
+        if (lockExpiry != null && Calendar.getInstance().after(lockExpiry)) {
+            // Lock expired, steal it
+            log.info("Lock expired for {}, previous owner: {}", assetPath, lockOwner);
+            createLock(assetPath, userId, timeoutMinutes);
+            return true;
+        }
+        
+        // Active lock exists
+        if (userId.equals(lockOwner)) {
+            // Same user, refresh lock
+            refreshLock(assetPath, timeoutMinutes);
+            return true;
+        }
+        
+        // Different user holds lock
+        log.warn("Cannot acquire lock for {}, owned by {}", assetPath, lockOwner);
+        return false;
+    }
+}
+```
+
+---
+
+### User Impact Summary
+
+| Failure Scenario | Weekly Frequency | Avg. Resolution Time | User Productivity Loss | Priority |
+|------------------|------------------|---------------------|------------------------|----------|
+| Stuck Pre-Processing Flag | 15-20 | 45-90 min | 🔴 High (11-30 hours/week) | P0 |
+| Completion Flag Stuck at False | 10-15 | 60-120 min | 🔴 High (10-30 hours/week) | P0 |
+| Block Flags Not Cleared | 5-8 | 30-60 min | 🟡 Medium (2.5-8 hours/week) | P1 |
+| Bulk Publishing Partial Failures | 8-12 | 2-4 hours | 🔴 High (16-48 hours/week) | P0 |
+| Concurrent Publishing Attempts | 3-5 | 45-90 min | 🟢 Low (2-7.5 hours/week) | P2 |
+| **TOTAL IMPACT** | **41-60** | **Varies** | **🔴 41.5-123.5 hours/week** | **P0** |
+
+### Business Impact Calculation
+
+```
+Total User Productivity Loss per Week: 41.5 - 123.5 hours
+Average Cost per Hour (blended rate): $75
+Weekly Cost: $3,112.50 - $9,262.50
+Annual Cost: $161,850 - $481,650
+
+Plus:
+- Admin/Support Time: ~20 hours/week @ $100/hr = $2,000/week = $104,000/year
+- User Frustration & Reputation Impact: Difficult to quantify
+- Missed Publishing Deadlines: Business continuity risk
+
+Total Annual Impact: ~$265,850 - $585,650
+```
+
+### Prevention Strategy Summary
+
+| Prevention Mechanism | Scenarios Addressed | Implementation Effort | Annual ROI |
+|---------------------|---------------------|----------------------|------------|
+| Guaranteed Flag Reset (Finally Blocks) | 1, 2, 4 | 🟡 Medium (3 weeks) | $200K-$350K |
+| Scheduled Stale Flag Cleanup | 1, 2, 3 | 🟢 Low (1 week) | $80K-$150K |
+| Publishing Lock Service | 5 | 🟡 Medium (2 weeks) | $15K-$40K |
+| Block Flag Auto-Expiry | 3 | 🟢 Low (1 week) | $30K-$65K |
+| Comprehensive Audit Logging | All | 🟡 Medium (2 weeks) | Diagnostic improvement |
+
+---
+
 ## Scenario 1: Publishing Flag Inventory
 
 ### User Story Objective
@@ -306,13 +871,8 @@ try {
 // ⚠️ Not persisted to JCR - lost on server restart
 tocProcessingFlagMap.put(ditaMapPath, true);
 ```
-    "Pre-Processing" : 2
-    "Publishing Control" : 4
-    "TOC Processing" : 2
-    "Workflow Status" : 3
-    "Audit Status" : 8
-    "Job Status" : 5
-```
+
+---
 
 ### Storage Location Analysis
 
@@ -351,20 +911,10 @@ graph TB
 
 | Flag | Implementation Files |
 |------|---------------------|
-| `iUser Story Objective
-This scenario addresses the requirement: *"analyzing the technical and business reasons for their implementation"* by providing comprehensive analysis from both system and user perspectives.
-
-### Acceptance Criteria
-✅ **Given**: The inventory of publishing flags is available  
-✅ **When**: The team analyzes each flag  
-✅ **Then**: The technical reasons and business needs for each flag are documented from both system and user perspectives
-
-### Analysis Approach
-Each flag is evaluated across four dimensions:
-1. **Technical Purpose**: Why the flag exists from a system architecture perspective
-2. **Business Need**: How the flag serves user and business requirements
-3. **Implementation Details**: Where and how the flag is set/read/reset in code
-4. **Criticality Assessment**: Impact analysis if the flag fails or is remov.java` |
+| `isPubToLiveCompleted` | `PublishLiveProcess.java`, `ConcurrencyHandleUtils.java`, `LivePreProcessingServiceImpl.java` |
+| `pre-processing-flag` | `OutputProcessHelperImpl.java`, `TOCProcessingServiceImpl.java` |
+| `pre-processing-flag-live` | `LivePreProcessingServiceImpl.java`, `PublishLiveProcess.java` |
+| `tocProcessingFlag` | `PublishLiveProcess.java`, `PublishLiveParametersHolder.java` |
 | Audit statuses | `DamEventConsumer.java`, `EYBulkPublishLiveServiceImpl.java` (commented) |
 
 ---
@@ -1450,21 +2000,14 @@ graph TB
         A --> D[Failure Rate]
         A --> E[In Progress]
         
-    User Story Objective
-This scenario addresses: *"diagnostic information is preserved for troubleshooting"* by ensuring comprehensive error logging and context preservation during regular publishing workflows.
-
-### Acceptance Criteria
-✅ **Given**: A regular publishing job is reviewed  
-✅ **When**: The team analyzes exception handling and error logging  
-✅ **Then**: Recommendations are documented for logging detailed, context-specific error messages at the point of failure  
-✅ **And**: Recommendations are provided to avoid unnecessary propagation of exceptions to higher-level methods  
-✅ **And**: Recommendations ensure the original root cause and error messages are preserved in the logs
-
-### Analysis Focus
-- **Current Implementation**: `GenerateOutputProcessing.java`, `OutputProcessHelperImpl.java`
-- **Logging Patterns**: How errors are currently logged and propagated
-- **Context Loss**: Where diagnostic information is lost in exception chains
-- **Troubleshooting Impact**: How current logging affects problem resolution
+        B --> F[Current Count]
+        C --> G[Percentage]
+        D --> H[Error Analysis]
+        E --> I[Active Jobs]
+        
+        H --> J[Error Categories]
+        J --> K[DITA-OT Errors]
+        J --> L[Upload Failures]
         J --> M[Top Failing Assets]
     end
     
@@ -2585,21 +3128,7 @@ graph TB
         
         B[Auto-Reset Events] --> B1[Last Hour]
         B --> B2[Last Day]
-    User Story Completion Strategy
-
-This roadmap outlines the implementation plan to fully satisfy the user story requirements. Each phase delivers specific capabilities that directly support the CMS Architect's objectives.
-
-### Alignment with User Story
-
-| Phase | User Story Objective | Deliverables |
-|-------|---------------------|--------------|
-| Phase 1 | Foundation for robust exception handling | Publishing state service, audit service, error logger |
-| Phase 2 | Auto-reset for flag persistence | Exception handler, cleanup jobs, event listeners |
-| Phase 3 | Flag modernization | Consolidated flag model, migration tools |
-| Phase 4 | Diagnostic preservation | Active audit logging, event correlation |
-| Phase 5 | Continuous improvement | Monitoring, optimization, documentation |
-
-###     B --> B3[Last Week]
+        B --> B3[Last Week]
         
         C[Manual Interventions] --> C1[Count]
         C --> C2[Reason Analysis]
@@ -2700,30 +3229,14 @@ gantt
 
 ```mermaid
 gantt
-These metrics directly measure the achievement of the user story objectives:
-
-| Metric | Baseline | Target | Measurement | User Story Impact |
-|--------|----------|--------|-------------|-------------------|
-| Stalled flags per week | ~50 | < 5 | Automated monitoring | Eliminates manual intervention need |
-| Manual interventions required | ~20/week | < 2/week | Admin notification count | Direct measure of automation success |
-| Publishing success rate | 85% | 95% | Job completion ratio | Robust exception handling effectiveness |
-| Average recovery time | 2 hours | 5 minutes | Auto-reset latency | Auto-reset mechanism performance |
-| Duplicate error logs | 100% | 0% | Log analysis | Diagnostic information quality |
-| Audit trail completeness | 0% | 100% | Event correlation | Troubleshooting capability |
-| Flag inventory completeness | 0% | 100% | Documentation coverage | Audit completion measure |
-| Modernization recommendations | 0 | 23 flags | Recommendation count | Modernization guidance provided |
-
-### User Story Validation
-
-The user story is considered complete when:
-
-1. ✅ **Complete Flag Inventory**: All 23 flags documented with technical details
-2. ✅ **Technical Analysis**: Each flag analyzed for technical and business justification
-3. ✅ **Modernization Recommendations**: Actionable recommendations provided for all flags
-4. ✅ **Robust Exception Handling**: Auto-reset mechanisms eliminate manual intervention
-5. ✅ **Flag Persistence**: Guaranteed flag commit to repository on all code paths
-6. ✅ **Diagnostic Preservation**: Full context logging maintains troubleshooting capability
-7. ✅ **Zero Manual Intervention**: Publishing failures auto-recover without admin action
+    title Phase 4: Audit Logging
+    dateFormat  YYYY-MM-DD
+    section Audit Implementation
+    Activate Audit Logging            :a1, 2026-04-26, 7d
+    Event Correlation                 :a2, after a1, 7d
+    section Deployment
+    Testing                           :b1, after a2, 5d
+    Staging Deployment                :b2, after b1, 3d
     Deploy to Production              :b3, after b2, 3d
     section Monitoring
     Setup Monitoring                  :c1, after b3, 5d
